@@ -3,9 +3,20 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from utils.allocator import SeatAllocator, SEAT_MATRIX
 import json
 from datetime import datetime
+from itertools import product
+
+# ============================================================================
+# CONSTANTS & CONFIGURATION
+# ============================================================================
+
+# Define the seat matrix based on categories
+SEAT_MATRIX = {
+    'SM': 50, 'EW': 10, 'EZ': 9, 'MU': 8, 'SC': 8, 
+    'BH': 3, 'LA': 3, 'DV': 2, 'VK': 2, 'ST': 2, 
+    'KN': 1, 'BX': 1, 'KU': 1
+}
 
 # Page configuration
 st.set_page_config(
@@ -15,7 +26,10 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
+# ============================================================================
+# CUSTOM CSS
+# ============================================================================
+
 st.markdown("""
 <style>
     .main-header {
@@ -48,8 +62,238 @@ st.markdown("""
         background-color: #2c8bcb;
         color: white;
     }
+    .success-message {
+        padding: 1rem;
+        background-color: #d4edda;
+        border-radius: 0.5rem;
+        color: #155724;
+        margin: 1rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
+
+# ============================================================================
+# SEAT ALLOCATOR CLASS
+# ============================================================================
+
+class SeatAllocator:
+    """
+    Seat allocation using Hamilton rounding and biproportional methods
+    """
+    
+    def __init__(self, college_data):
+        """
+        Initialize with college data
+        
+        Args:
+            college_data: DataFrame with columns ['Program', 'Specialty', 'College', 'Seats', 'Type']
+        """
+        self.college_data = college_data
+        self.categories = list(SEAT_MATRIX.keys())
+        self.total_seats = sum(SEAT_MATRIX.values())
+        self.validate_data()
+    
+    def validate_data(self):
+        """Validate input data"""
+        required_columns = ['Program', 'Specialty', 'College', 'Seats', 'Type']
+        for col in required_columns:
+            if col not in self.college_data.columns:
+                raise ValueError(f"Missing required column: {col}")
+        
+        if (self.college_data['Seats'] <= 0).any():
+            raise ValueError("All seat values must be positive")
+    
+    def hamilton_rounding(self, proportions, total_seats):
+        """
+        Hamilton (largest remainder) method for seat allocation
+        
+        Args:
+            proportions: Array of proportional shares
+            total_seats: Total number of seats to allocate
+        
+        Returns:
+            Array of allocated seats
+        """
+        if len(proportions) == 0 or total_seats <= 0:
+            return np.zeros(len(proportions), dtype=int)
+        
+        # Calculate initial allocation (floor)
+        initial_seats = np.floor(proportions * total_seats).astype(int)
+        remainder = proportions * total_seats - initial_seats
+        
+        # Allocate remaining seats to largest remainders
+        remaining_seats = total_seats - initial_seats.sum()
+        if remaining_seats > 0:
+            # Get indices of largest remainders
+            largest_remainder_indices = np.argsort(remainder)[-remaining_seats:]
+            initial_seats[largest_remainder_indices] += 1
+        
+        return initial_seats
+    
+    def biproportional_allocation(self, row_margins, col_margins, max_iterations=1000, tolerance=1e-6):
+        """
+        Biproportional allocation using iterative proportional fitting
+        
+        Args:
+            row_margins: Row marginals (colleges)
+            col_margins: Column marginals (specialties)
+            max_iterations: Maximum iterations for convergence
+            tolerance: Convergence tolerance
+        
+        Returns:
+            Allocated matrix
+        """
+        n_rows = len(row_margins)
+        n_cols = len(col_margins)
+        
+        if n_rows == 0 or n_cols == 0:
+            return np.zeros((n_rows, n_cols), dtype=int)
+        
+        # Initialize with uniform distribution
+        matrix = np.ones((n_rows, n_cols))
+        
+        # Iterative proportional fitting
+        for iteration in range(max_iterations):
+            # Scale rows
+            row_sums = matrix.sum(axis=1)
+            for i in range(n_rows):
+                if row_sums[i] > 0:
+                    matrix[i, :] *= row_margins[i] / row_sums[i]
+            
+            # Scale columns
+            col_sums = matrix.sum(axis=0)
+            for j in range(n_cols):
+                if col_sums[j] > 0:
+                    matrix[:, j] *= col_margins[j] / col_sums[j]
+            
+            # Check convergence
+            if np.allclose(matrix.sum(axis=1), row_margins, rtol=tolerance) and \
+               np.allclose(matrix.sum(axis=0), col_margins, rtol=tolerance):
+                break
+        
+        # Round to integers using Hamilton method for each row
+        rounded_matrix = np.zeros_like(matrix)
+        for i in range(n_rows):
+            if matrix[i, :].sum() > 0:
+                rounded_matrix[i, :] = self.hamilton_rounding(
+                    matrix[i, :] / matrix[i, :].sum(), 
+                    int(row_margins[i])
+                )
+        
+        return rounded_matrix.astype(int)
+    
+    def calculate_allocations(self):
+        """
+        Calculate seat allocations using both methods
+        
+        Returns:
+            Tuple of (results dictionary, colleges array, specialties array)
+        """
+        # Get unique colleges and specialties
+        colleges = self.college_data['College'].unique()
+        specialties = self.college_data['Specialty'].unique()
+        
+        # Create mapping for college-specialty combinations
+        college_specialty_map = {}
+        for _, row in self.college_data.iterrows():
+            key = (row['College'], row['Specialty'])
+            college_specialty_map[key] = row['Seats']
+        
+        # Create matrices for allocation
+        n_colleges = len(colleges)
+        n_specialties = len(specialties)
+        
+        # Total seats per college and specialty
+        college_seats = np.array([
+            sum(college_specialty_map.get((college, spec), 0) 
+                for spec in specialties)
+            for college in colleges
+        ])
+        
+        specialty_seats = np.array([
+            sum(college_specialty_map.get((college, spec), 0) 
+                for college in colleges)
+            for spec in specialties
+        ])
+        
+        # Calculate category shares based on SEAT_MATRIX
+        category_shares = np.array(list(SEAT_MATRIX.values())) / self.total_seats
+        
+        # Initialize result storage
+        results = {
+            'hamilton': {},
+            'biproportional': {}
+        }
+        
+        # For each category, allocate seats
+        for cat_idx, category in enumerate(self.categories):
+            category_total = SEAT_MATRIX[category]
+            
+            # Method 1: Hamilton rounding
+            # Calculate proportions for each college-specialty combination
+            proportions = []
+            for college in colleges:
+                for specialty in specialties:
+                    seats = college_specialty_map.get((college, specialty), 0)
+                    proportions.append(seats)
+            
+            proportions = np.array(proportions)
+            total_seats_for_distribution = sum(proportions)
+            
+            if total_seats_for_distribution > 0:
+                ham_allocation = self.hamilton_rounding(
+                    proportions / total_seats_for_distribution, 
+                    category_total
+                )
+            else:
+                ham_allocation = np.zeros(len(proportions))
+            
+            # Reshape to college-specialty matrix
+            ham_matrix = ham_allocation.reshape(n_colleges, n_specialties)
+            
+            # Method 2: Biproportional allocation
+            # Create row and column margins for this category
+            if n_colleges > 0 and n_specialties > 0:
+                row_margins = college_seats * category_shares[cat_idx]
+                col_margins = specialty_seats * category_shares[cat_idx]
+                
+                # Ensure margins sum to category total
+                if row_margins.sum() > 0:
+                    row_margins = row_margins / row_margins.sum() * category_total
+                if col_margins.sum() > 0:
+                    col_margins = col_margins / col_margins.sum() * category_total
+                
+                # Round margins to integers
+                row_margins = np.round(row_margins).astype(int)
+                col_margins = np.round(col_margins).astype(int)
+                
+                # Adjust to ensure sum equals category total
+                while row_margins.sum() != category_total and row_margins.sum() > 0:
+                    if row_margins.sum() < category_total:
+                        row_margins[np.argmax(college_seats)] += 1
+                    else:
+                        row_margins[np.argmin(college_seats)] -= 1
+                
+                while col_margins.sum() != category_total and col_margins.sum() > 0:
+                    if col_margins.sum() < category_total:
+                        col_margins[np.argmax(specialty_seats)] += 1
+                    else:
+                        col_margins[np.argmin(specialty_seats)] -= 1
+                
+                # Create biproportional matrix
+                bipro_matrix = self.biproportional_allocation(row_margins, col_margins)
+            else:
+                bipro_matrix = np.zeros((n_colleges, n_specialties), dtype=int)
+            
+            # Store results
+            results['hamilton'][category] = ham_matrix
+            results['biproportional'][category] = bipro_matrix
+        
+        return results, colleges, specialties
+
+# ============================================================================
+# UI FUNCTIONS
+# ============================================================================
 
 def initialize_session_state():
     """Initialize session state variables"""
@@ -63,14 +307,6 @@ def initialize_session_state():
         st.session_state.calculated = False
     if 'history' not in st.session_state:
         st.session_state.history = []
-
-def save_to_history(data):
-    """Save calculation results to history"""
-    entry = {
-        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        'data': data
-    }
-    st.session_state.history.append(entry)
 
 def display_metric_cards(total_seats, n_colleges, n_specialties):
     """Display metric cards in a row"""
@@ -141,14 +377,7 @@ def display_results_tabs(results, colleges, specialties):
         
         st.dataframe(
             pd.DataFrame(ham_summary),
-            use_container_width=True,
-            column_config={
-                "Category": "Category",
-                "Allocated": st.column_config.NumberColumn("Allocated", format="%d"),
-                "Expected": st.column_config.NumberColumn("Expected", format="%d"),
-                "Difference": st.column_config.NumberColumn("Difference", format="%d"),
-                "Percentage": "Allocation %"
-            }
+            use_container_width=True
         )
         
         # Detailed matrices
@@ -184,14 +413,7 @@ def display_results_tabs(results, colleges, specialties):
         
         st.dataframe(
             pd.DataFrame(bipro_summary),
-            use_container_width=True,
-            column_config={
-                "Category": "Category",
-                "Allocated": st.column_config.NumberColumn("Allocated", format="%d"),
-                "Expected": st.column_config.NumberColumn("Expected", format="%d"),
-                "Difference": st.column_config.NumberColumn("Difference", format="%d"),
-                "Percentage": "Allocation %"
-            }
+            use_container_width=True
         )
         
         with st.expander("View Detailed Allocation Matrices"):
@@ -261,6 +483,44 @@ def display_results_tabs(results, colleges, specialties):
             )
         )
         st.plotly_chart(fig, use_container_width=True)
+        
+        # Difference analysis
+        st.markdown("#### Difference Analysis")
+        diff_data = []
+        for category in SEAT_MATRIX.keys():
+            ham_total = results['hamilton'][category].sum()
+            bipro_total = results['biproportional'][category].sum()
+            expected = SEAT_MATRIX[category]
+            
+            diff_data.append({
+                'Category': category,
+                'Hamilton Deviation': ham_total - expected,
+                'Biproportional Deviation': bipro_total - expected,
+                'Method Difference': ham_total - bipro_total
+            })
+        
+        df_diff = pd.DataFrame(diff_data)
+        fig_diff = go.Figure()
+        fig_diff.add_trace(go.Bar(
+            x=df_diff['Category'],
+            y=df_diff['Hamilton Deviation'],
+            name='Hamilton Deviation',
+            marker_color='#2ca02c'
+        ))
+        fig_diff.add_trace(go.Bar(
+            x=df_diff['Category'],
+            y=df_diff['Biproportional Deviation'],
+            name='Biproportional Deviation',
+            marker_color='#ff7f0e'
+        ))
+        fig_diff.update_layout(
+            title='Deviation from Expected Values',
+            xaxis_title='Category',
+            yaxis_title='Deviation',
+            barmode='group',
+            height=400
+        )
+        st.plotly_chart(fig_diff, use_container_width=True)
     
     with tab4:
         st.markdown("### Detailed Breakdown")
@@ -371,7 +631,7 @@ def display_results_tabs(results, colleges, specialties):
         
         viz_type = st.selectbox(
             "Select visualization type",
-            ['Heatmap', '3D Surface', 'Sunburst', 'Treemap']
+            ['Heatmap', '3D Surface', 'Sunburst', 'Treemap', 'Bar Chart']
         )
         
         method_key = viz_method.lower()
@@ -381,6 +641,24 @@ def display_results_tabs(results, colleges, specialties):
             cols = st.columns(3)
             for idx, (category, matrix) in enumerate(results[method_key].items()):
                 if idx < 3:
+                    with cols[idx % 3]:
+                        fig = px.imshow(
+                            matrix,
+                            x=specialties,
+                            y=colleges,
+                            title=f"{category} - {viz_method}",
+                            text_auto=True,
+                            aspect="auto",
+                            color_continuous_scale="Viridis"
+                        )
+                        fig.update_layout(height=400)
+                        st.plotly_chart(fig, use_container_width=True)
+            
+            # Show remaining categories if any
+            if len(results[method_key]) > 3:
+                st.markdown("#### Additional Categories")
+                cols = st.columns(3)
+                for idx, (category, matrix) in enumerate(list(results[method_key].items())[3:]):
                     with cols[idx % 3]:
                         fig = px.imshow(
                             matrix,
@@ -440,9 +718,13 @@ def display_results_tabs(results, colleges, specialties):
                     df_sunburst,
                     path=['Category', 'College', 'Specialty'],
                     values='Seats',
-                    title=f'Seat Distribution - {viz_method} Method'
+                    title=f'Seat Distribution - {viz_method} Method',
+                    color='Seats',
+                    color_continuous_scale='Viridis'
                 )
                 st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("No data available for sunburst chart")
         
         elif viz_type == 'Treemap':
             # Prepare data for treemap
@@ -470,6 +752,46 @@ def display_results_tabs(results, colleges, specialties):
                     color_continuous_scale='Viridis'
                 )
                 st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("No data available for treemap")
+        
+        elif viz_type == 'Bar Chart':
+            # Bar chart visualization
+            category = st.selectbox(
+                "Select category for bar chart",
+                list(SEAT_MATRIX.keys())
+            )
+            matrix = results[method_key][category]
+            
+            # Prepare data
+            bar_data = []
+            for i, college in enumerate(colleges):
+                for j, specialty in enumerate(specialties):
+                    seats = matrix[i, j]
+                    if seats > 0:
+                        bar_data.append({
+                            'College': college,
+                            'Specialty': specialty,
+                            'Seats': seats
+                        })
+            
+            df_bar = pd.DataFrame(bar_data)
+            if not df_bar.empty:
+                fig = px.bar(
+                    df_bar,
+                    x='College',
+                    y='Seats',
+                    color='Specialty',
+                    title=f'{category} - {viz_method} Method',
+                    barmode='group',
+                    text='Seats'
+                )
+                fig.update_traces(textposition='outside')
+                st.plotly_chart(fig, use_container_width=True)
+
+# ============================================================================
+# MAIN APPLICATION
+# ============================================================================
 
 def main():
     """Main application function"""
@@ -506,11 +828,11 @@ def main():
         if input_option == 'Use Sample Data':
             # Sample data with more colleges
             sample_data = pd.DataFrame({
-                'Program': ['E', 'E', 'E', 'E', 'E', 'E', 'E', 'E'],
-                'Specialty': ['DS', 'DS', 'DS', 'AI', 'AI', 'CS', 'CS', 'CS'],
-                'College': ['CDI', 'CDP', 'CDT', 'CDI', 'CDP', 'CDT', 'CDI', 'CDP'],
-                'Seats': [1, 1, 4, 2, 3, 1, 2, 1],
-                'Type': ['G', 'G', 'G', 'G', 'G', 'G', 'G', 'G']
+                'Program': ['E', 'E', 'E', 'E', 'E', 'E', 'E', 'E', 'E', 'E', 'E', 'E'],
+                'Specialty': ['DS', 'DS', 'DS', 'AI', 'AI', 'CS', 'CS', 'CS', 'ML', 'ML', 'DS', 'AI'],
+                'College': ['CDI', 'CDP', 'CDT', 'CDI', 'CDP', 'CDT', 'CDI', 'CDP', 'CDT', 'CDI', 'CDP', 'CDT'],
+                'Seats': [1, 1, 4, 2, 3, 1, 2, 1, 2, 1, 1, 2],
+                'Type': ['G', 'G', 'G', 'G', 'G', 'G', 'G', 'G', 'G', 'G', 'G', 'G']
             })
             college_data = sample_data
             st.dataframe(sample_data, use_container_width=True)
@@ -528,7 +850,7 @@ def main():
                 st.info("Please upload a CSV file")
                 
         elif input_option == 'Manual Entry':
-            st.info("Manual entry option - enter data below")
+            st.info("Enter data manually below")
             n_rows = st.number_input("Number of entries", min_value=1, max_value=20, value=3)
             
             # Create editable dataframe
@@ -569,14 +891,6 @@ def main():
                         st.session_state.specialties = specialties
                         st.session_state.calculated = True
                         
-                        # Save to history
-                        save_to_history({
-                            'college_data': college_data.to_dict(),
-                            'results': results,
-                            'colleges': list(colleges),
-                            'specialties': list(specialties)
-                        })
-                        
                         st.success("✅ Allocations calculated successfully!")
                         st.balloons()
                         
@@ -602,15 +916,6 @@ def main():
             st.session_state.specialties
         )
         
-        # History section
-        with st.expander("📜 Calculation History"):
-            if st.session_state.history:
-                for i, entry in enumerate(reversed(st.session_state.history[-5:])):
-                    st.markdown(f"**{entry['timestamp']}**")
-                    st.json(entry['data']['college_data'])
-            else:
-                st.info("No calculation history yet")
-    
     else:
         # Welcome message when no calculation done
         st.markdown("""
@@ -644,32 +949,49 @@ def main():
         """)
         
         # Sample visualization preview
-        st.markdown("### 🎨 Preview")
+        st.markdown("### 🎨 Method Comparison Preview")
         col1, col2, col3 = st.columns(3)
         
         with col1:
             st.markdown("""
-            **Hamilton Method**
+            **Hamilton Method** ✅
             - Simple and transparent
             - Based on largest remainders
             - Easy to understand
+            - Good for simple allocations
             """)
         
         with col2:
             st.markdown("""
-            **Biproportional Method**
+            **Biproportional Method** ✅
             - Balances multiple constraints
             - Iterative fitting algorithm
             - More complex but precise
+            - Handles complex scenarios
             """)
         
         with col3:
             st.markdown("""
-            **Comparison**
-            - Visual comparisons
+            **Comparison Features** 📊
+            - Side-by-side comparison
             - Difference analysis
-            - Method selection guidance
+            - Visual representations
+            - Export capabilities
             """)
+        
+        # Example visualization
+        st.markdown("### 📈 Example Visualization")
+        example_data = {
+            'Category': ['SM', 'EW', 'EZ', 'MU', 'SC', 'BH', 'LA', 'DV', 'VK', 'ST', 'KN', 'BX', 'KU'],
+            'Seats': [50, 10, 9, 8, 8, 3, 3, 2, 2, 2, 1, 1, 1]
+        }
+        df_example = pd.DataFrame(example_data)
+        fig = px.pie(df_example, values='Seats', names='Category', title='Seat Distribution by Category')
+        st.plotly_chart(fig, use_container_width=True)
+
+# ============================================================================
+# RUN APPLICATION
+# ============================================================================
 
 if __name__ == "__main__":
     main()
